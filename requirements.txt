@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+pydantic
+requests
+python-multipart
+sqlalchemy
+pyjwt
+bcrypt
+cryptography
+pytest
+httpx
