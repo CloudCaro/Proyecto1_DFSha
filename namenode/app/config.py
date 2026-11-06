@@ -24,3 +24,18 @@ HEARTBEAT_TIMEOUT = 15
 BLOCK_SIZE = 4 * 1024 * 1024
 
 REPLICATION_FACTOR = 2
+
+# ==========================================
+# CONFIGURACIÓN DE SEGURIDAD
+# ==========================================
+
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
+
+if not JWT_SECRET_KEY:
+    raise RuntimeError(
+        "No se ha configurado JWT_SECRET_KEY"
+    )
+
+JWT_ALGORITHM = "HS256"
+
+JWT_ACCESS_TOKEN_EXPIRE_MINUTES = 60

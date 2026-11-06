@@ -2,7 +2,8 @@ from fastapi import FastAPI
 
 from app.database import create_tables
 from app.routes.datanodes import router as datanodes_router
-
+from app.routes.auth import router as auth_router
+from app.routes.filesystem import router as filesystem_router
 
 app = FastAPI(
     title="DFSha - Namenode",
@@ -33,3 +34,6 @@ def health():
         "service": "Namenode",
         "status": "healthy"
     }
+
+app.include_router(auth_router)
+app.include_router(filesystem_router)
