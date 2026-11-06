@@ -1,5 +1,8 @@
 from fastapi import FastAPI
 
+from app.routes.deletes import router as deletes_router
+from app.routes.reads import router as reads_router
+from app.routes.writes import router as writes_router
 from app.database import create_tables
 from app.routes.datanodes import router as datanodes_router
 from app.routes.auth import router as auth_router
@@ -37,3 +40,6 @@ def health():
 
 app.include_router(auth_router)
 app.include_router(filesystem_router)
+app.include_router(writes_router)
+app.include_router(reads_router)
+app.include_router(deletes_router)
