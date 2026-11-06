@@ -1,28 +1,28 @@
-import uuid
 import logging
+import uuid
 
 from datetime import datetime, timedelta, timezone
 
-from fastapi import (
-    APIRouter,
-    Depends,
-    HTTPException,
-    Query
-)
-
-from sqlalchemy.orm import Session
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session, joinedload
 
 from app.database import get_db
 
 from app.models import (
     User,
     FileMetadata,
+    FileVersion,
+    VersionBlock,
     WriteSession,
-    FileLock
+    FileLock,
+    FileVersion,
+    VersionBlock,
+    Block,
+    BlockReplica
 )
 
 from app.security import get_current_user
-
 from app.routes.reads import retrieve_block
 
 
@@ -41,13 +41,31 @@ def current_time():
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-# ==========================================
-# OPEN: ABRIR ARCHIVO
-# ==========================================
+def get_session_or_404(db, session_id, user_id):
+
+    session = db.query(WriteSession).filter(
+        WriteSession.session_id == session_id,
+        WriteSession.user_id == user_id
+    ).first()
+
+    if not session:
+        raise HTTPException(404, "Sesión no encontrada")
+
+    if session.status not in ("OPEN_READ", "OPEN_WRITE"):
+        raise HTTPException(409, "La sesión no está abierta")
+
+    if session.expires_at <= current_time():
+        session.status = "EXPIRED"
+        db.commit()
+        raise HTTPException(401, "La sesión ha expirado")
+
+    return session
+
 
 @router.post("/open/{file_id}")
 def open_file(
     file_id: int,
+    mode: str = Query(default="r", regex="^(r|w)$"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -59,22 +77,40 @@ def open_file(
     ).first()
 
     if not file_metadata:
+        raise HTTPException(404, "Archivo no encontrado")
 
-        raise HTTPException(
-            status_code=404,
-            detail="Archivo no encontrado o no disponible"
-        )
+    version = db.query(FileVersion).filter(
+        FileVersion.file_id == file_id,
+        FileVersion.version_number == file_metadata.version,
+        FileVersion.status == "ACTIVE"
+    ).first()
+
+    if not version:
+        raise HTTPException(500, "No existe la versión activa del archivo")
+
+    if mode == "w":
+
+        lock = db.query(FileLock).filter(
+            FileLock.file_id == file_id
+        ).first()
+
+        if lock and lock.expires_at > current_time():
+            raise HTTPException(423, "El archivo ya está bloqueado")
+
+        if lock:
+            db.delete(lock)
+            db.flush()
 
     session_id = uuid.uuid4().hex
 
     session = WriteSession(
         session_id=session_id,
         user_id=current_user.id,
-        file_id=file_metadata.id,
-        status="OPEN",
-        expires_at=current_time() + timedelta(
-            minutes=SESSION_DURATION
-        )
+        file_id=file_id,
+        version_id=version.id,
+        mode=mode,
+        status="OPEN_READ" if mode == "r" else "OPEN_WRITE",
+        expires_at=current_time() + timedelta(minutes=SESSION_DURATION)
     )
 
     db.add(session)
@@ -83,16 +119,102 @@ def open_file(
     return {
         "message": "Archivo abierto correctamente",
         "session_id": session_id,
-        "file_id": file_metadata.id,
+        "file_id": file_id,
         "filename": file_metadata.name,
-        "size": file_metadata.size,
-        "expires_at": session.expires_at.isoformat()
+        "mode": mode,
+        "version": version.version_number,
+        "version_id": version.id,
+        "size": version.size
     }
 
 
-# ==========================================
-# CLOSE: CERRAR SESIÓN
-# ==========================================
+@router.get("/read/{session_id}")
+def read_file(
+    session_id: str,
+    offset: int = Query(default=0, ge=0),
+    length: int = Query(default=4096, gt=0, le=4 * 1024 * 1024),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+
+    session = get_session_or_404(
+        db,
+        session_id,
+        current_user.id
+    )
+
+    if session.status != "OPEN_READ":
+        raise HTTPException(409, "La sesión no está abierta en modo lectura")
+
+    version = db.query(FileVersion).options(
+        joinedload(FileVersion.blocks)
+        .joinedload(VersionBlock.block)
+        .joinedload(Block.replicas)
+        .joinedload(BlockReplica.datanode)
+    ).filter(
+        FileVersion.id == session.version_id,
+        FileVersion.file_id == session.file_id
+    ).first()
+
+    if not version:
+        raise HTTPException(404, "La versión de lectura no está disponible")
+
+    if offset >= version.size:
+        return {
+            "file_id": session.file_id,
+            "version": version.version_number,
+            "offset": offset,
+            "bytes_read": 0,
+            "content_hex": ""
+        }
+
+    start = offset
+    end = min(offset + length, version.size)
+
+    result = bytearray()
+    cursor = 0
+
+    try:
+
+        for version_block in sorted(
+            version.blocks,
+            key=lambda item: item.block_index
+        ):
+
+            block = version_block.block
+
+            block_start = cursor
+            block_end = cursor + block.size
+
+            cursor = block_end
+
+            if block_end <= start or block_start >= end:
+                continue
+
+            block_content = retrieve_block(block)
+
+            local_start = max(start - block_start, 0)
+            local_end = min(end - block_start, len(block_content))
+
+            result.extend(block_content[local_start:local_end])
+
+        return {
+            "file_id": session.file_id,
+            "version": version.version_number,
+            "offset": offset,
+            "bytes_read": len(result),
+            "content_hex": bytes(result).hex()
+        }
+
+    except Exception as error:
+
+        logger.exception("Error leyendo versión %s", version.id)
+
+        raise HTTPException(
+            500,
+            detail=f"No se pudo leer el archivo: {error}"
+        )
+
 
 @router.post("/close/{session_id}")
 def close_file(
@@ -101,24 +223,21 @@ def close_file(
     db: Session = Depends(get_db)
 ):
 
-    session = db.query(WriteSession).filter(
-        WriteSession.session_id == session_id,
-        WriteSession.user_id == current_user.id
-    ).first()
+    session = get_session_or_404(
+        db,
+        session_id,
+        current_user.id
+    )
 
-    if not session:
+    if session.status == "OPEN_WRITE":
 
-        raise HTTPException(
-            status_code=404,
-            detail="Sesión no encontrada"
-        )
+        lock = db.query(FileLock).filter(
+            FileLock.file_id == session.file_id,
+            FileLock.user_id == current_user.id
+        ).first()
 
-    if session.status != "OPEN":
-
-        raise HTTPException(
-            status_code=409,
-            detail="La sesión no está abierta"
-        )
+        if lock:
+            db.delete(lock)
 
     session.status = "CLOSED"
     session.completed_at = current_time()
@@ -131,187 +250,65 @@ def close_file(
     }
 
 
-# ==========================================
-# READ: LEER CONTENIDO DEL ARCHIVO
-# ==========================================
-
-@router.get("/read/{session_id}")
-def read_file(
-    session_id: str,
-    offset: int = Query(default=0, ge=0),
-    length: int = Query(default=4096, gt=0, le=4 * 1024 * 1024),
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-
-    session = db.query(WriteSession).filter(
-        WriteSession.session_id == session_id,
-        WriteSession.user_id == current_user.id
-    ).first()
-
-    if not session or session.status != "OPEN":
-
-        raise HTTPException(
-            status_code=409,
-            detail="La sesión no está abierta"
-        )
-
-    if session.expires_at <= current_time():
-
-        session.status = "EXPIRED"
-        db.commit()
-
-        raise HTTPException(
-            status_code=401,
-            detail="La sesión ha expirado"
-        )
-
-    file_metadata = db.query(FileMetadata).filter(
-        FileMetadata.id == session.file_id,
-        FileMetadata.owner_id == current_user.id,
-        FileMetadata.status == "ACTIVE"
-    ).first()
-
-    if not file_metadata:
-
-        raise HTTPException(
-            status_code=404,
-            detail="Archivo no disponible"
-        )
-
-    if offset >= file_metadata.size:
-
-        return {
-            "file_id": file_metadata.id,
-            "offset": offset,
-            "bytes_read": 0,
-            "content_hex": ""
-        }
-
-    try:
-
-        # Reconstruir el archivo verificando cada bloque.
-
-        content = bytearray()
-
-        for block in file_metadata.blocks:
-
-            block_content = retrieve_block(block)
-
-            content.extend(block_content)
-
-        content = bytes(content)
-
-        # Verificar integridad del archivo completo.
-
-        import hashlib
-
-        if hashlib.sha256(content).hexdigest() != file_metadata.sha256:
-
-            raise RuntimeError(
-                "La integridad del archivo no pudo verificarse"
-            )
-
-        # Leer el segmento solicitado.
-
-        result = content[offset:offset + length]
-
-        return {
-            "file_id": file_metadata.id,
-            "filename": file_metadata.name,
-            "offset": offset,
-            "bytes_read": len(result),
-            "content_hex": result.hex()
-        }
-
-    except Exception as error:
-
-        logger.exception(
-            "Error leyendo archivo %s",
-            file_metadata.id
-        )
-
-        raise HTTPException(
-            status_code=500,
-            detail=f"No se pudo leer el archivo: {error}"
-        )
-
-
-# ==========================================
-# LOCK: BLOQUEO EXCLUSIVO
-# ==========================================
-
 @router.post("/lock/{file_id}")
 def lock_file(
     file_id: int,
+    session_id: str,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
 
-    file_metadata = db.query(FileMetadata).filter(
-        FileMetadata.id == file_id,
-        FileMetadata.owner_id == current_user.id,
-        FileMetadata.status == "ACTIVE"
-    ).first()
+    session = get_session_or_404(
+        db,
+        session_id,
+        current_user.id
+    )
 
-    if not file_metadata:
-
+    if session.file_id != file_id or session.status != "OPEN_WRITE":
         raise HTTPException(
-            status_code=404,
-            detail="Archivo no encontrado"
+            409,
+            "Se necesita una sesión abierta en modo escritura"
         )
 
-    existing_lock = db.query(FileLock).filter(
+    now = current_time()
+
+    existing = db.query(FileLock).filter(
         FileLock.file_id == file_id
     ).first()
 
-    if existing_lock:
+    if existing and existing.expires_at > now:
+        raise HTTPException(423, "El archivo ya tiene un bloqueo activo")
 
-        if existing_lock.expires_at > current_time():
-
-            if existing_lock.user_id == current_user.id:
-
-                raise HTTPException(
-                    status_code=409,
-                    detail="El usuario ya tiene un bloqueo activo"
-                )
-
-            raise HTTPException(
-                status_code=423,
-                detail="El archivo está bloqueado por otro usuario"
-            )
-
-        # El bloqueo anterior expiró.
-
-        db.delete(existing_lock)
+    if existing:
+        db.delete(existing)
         db.flush()
 
-    lock_token = uuid.uuid4().hex
+    token = uuid.uuid4().hex
 
-    new_lock = FileLock(
+    lock = FileLock(
         file_id=file_id,
         user_id=current_user.id,
-        lock_token=lock_token,
-        acquired_at=current_time(),
-        expires_at=current_time() + timedelta(
-            seconds=LOCK_DURATION
-        )
+        lock_token=token,
+        acquired_at=now,
+        expires_at=now + timedelta(seconds=LOCK_DURATION)
     )
 
-    db.add(new_lock)
-    db.commit()
+    db.add(lock)
+
+    try:
+        db.commit()
+
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(423, "Otro usuario adquirió el bloqueo")
 
     return {
         "message": "Bloqueo adquirido correctamente",
         "file_id": file_id,
-        "lock_token": lock_token,
+        "lock_token": token,
         "expires_in_seconds": LOCK_DURATION
     }
 
-
-# ==========================================
-# UNLOCK: LIBERAR BLOQUEO
-# ==========================================
 
 @router.post("/unlock/{file_id}")
 def unlock_file(
@@ -321,20 +318,21 @@ def unlock_file(
     db: Session = Depends(get_db)
 ):
 
-    existing_lock = db.query(FileLock).filter(
+    lock = db.query(FileLock).filter(
         FileLock.file_id == file_id,
         FileLock.user_id == current_user.id,
         FileLock.lock_token == lock_token
     ).first()
 
-    if not existing_lock:
+    if not lock:
+        raise HTTPException(404, "Bloqueo no encontrado")
 
-        raise HTTPException(
-            status_code=404,
-            detail="No se encontró un bloqueo válido para este usuario"
-        )
+    if lock.expires_at <= current_time():
+        db.delete(lock)
+        db.commit()
+        raise HTTPException(410, "El bloqueo ha expirado")
 
-    db.delete(existing_lock)
+    db.delete(lock)
     db.commit()
 
     return {

@@ -8,7 +8,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     UniqueConstraint,
-    Text,
+    Index,
 )
 from sqlalchemy.orm import relationship
 
@@ -18,10 +18,6 @@ from app.database import Base
 def current_time():
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
-
-# ==========================================
-# USUARIOS
-# ==========================================
 
 class User(Base):
     __tablename__ = "users"
@@ -37,15 +33,8 @@ class User(Base):
         cascade="all, delete-orphan"
     )
 
-    files = relationship(
-        "FileMetadata",
-        back_populates="owner"
-    )
+    files = relationship("FileMetadata", back_populates="owner")
 
-
-# ==========================================
-# DIRECTORIOS
-# ==========================================
 
 class Directory(Base):
     __tablename__ = "directories"
@@ -66,10 +55,7 @@ class Directory(Base):
         backref="children"
     )
 
-    files = relationship(
-        "FileMetadata",
-        back_populates="directory"
-    )
+    files = relationship("FileMetadata", back_populates="directory")
 
     __table_args__ = (
         UniqueConstraint(
@@ -80,10 +66,6 @@ class Directory(Base):
         ),
     )
 
-
-# ==========================================
-# ARCHIVOS
-# ==========================================
 
 class FileMetadata(Base):
     __tablename__ = "files"
@@ -128,6 +110,13 @@ class FileMetadata(Base):
         cascade="all, delete-orphan"
     )
 
+    versions = relationship(
+        "FileVersion",
+        back_populates="file",
+        cascade="all, delete-orphan",
+        order_by="FileVersion.version_number"
+    )
+
     __table_args__ = (
         UniqueConstraint(
             "directory_id",
@@ -136,10 +125,6 @@ class FileMetadata(Base):
         ),
     )
 
-
-# ==========================================
-# BLOQUES
-# ==========================================
 
 class Block(Base):
     __tablename__ = "blocks"
@@ -164,6 +149,12 @@ class Block(Base):
         cascade="all, delete-orphan"
     )
 
+    version_references = relationship(
+        "VersionBlock",
+        back_populates="block",
+        cascade="all, delete-orphan"
+    )
+
     __table_args__ = (
         UniqueConstraint(
             "file_id",
@@ -173,9 +164,73 @@ class Block(Base):
     )
 
 
-# ==========================================
-# NODOS DE ALMACENAMIENTO
-# ==========================================
+class FileVersion(Base):
+    __tablename__ = "file_versions"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    file_id = Column(Integer, ForeignKey("files.id"), nullable=False)
+    version_number = Column(Integer, nullable=False)
+
+    size = Column(BigInteger, nullable=False)
+    sha256 = Column(String(64), nullable=False)
+
+    status = Column(String(30), default="ACTIVE")
+    created_at = Column(DateTime, default=current_time)
+
+    file = relationship("FileMetadata", back_populates="versions")
+
+    blocks = relationship(
+        "VersionBlock",
+        back_populates="version",
+        cascade="all, delete-orphan",
+        order_by="VersionBlock.block_index"
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "file_id",
+            "version_number",
+            name="unique_file_version"
+        ),
+    )
+
+
+class VersionBlock(Base):
+    __tablename__ = "version_blocks"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    version_id = Column(
+        Integer,
+        ForeignKey("file_versions.id"),
+        nullable=False
+    )
+
+    block_id = Column(
+        Integer,
+        ForeignKey("blocks.id"),
+        nullable=False
+    )
+
+    block_index = Column(Integer, nullable=False)
+
+    version = relationship("FileVersion", back_populates="blocks")
+    block = relationship("Block", back_populates="version_references")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "version_id",
+            "block_index",
+            name="unique_version_block_position"
+        ),
+        UniqueConstraint(
+            "version_id",
+            "block_id",
+            name="unique_version_block"
+        ),
+    )
+
 
 class DataNode(Base):
     __tablename__ = "datanodes"
@@ -195,15 +250,8 @@ class DataNode(Base):
 
     created_at = Column(DateTime, default=current_time)
 
-    replicas = relationship(
-        "BlockReplica",
-        back_populates="datanode"
-    )
+    replicas = relationship("BlockReplica", back_populates="datanode")
 
-
-# ==========================================
-# RÉPLICAS DE BLOQUES
-# ==========================================
 
 class BlockReplica(Base):
     __tablename__ = "block_replicas"
@@ -228,10 +276,6 @@ class BlockReplica(Base):
     )
 
 
-# ==========================================
-# BLOQUEOS DE ARCHIVOS
-# ==========================================
-
 class FileLock(Base):
     __tablename__ = "file_locks"
 
@@ -254,10 +298,6 @@ class FileLock(Base):
     file = relationship("FileMetadata", back_populates="lock")
 
 
-# ==========================================
-# SESIONES DE ESCRITURA
-# ==========================================
-
 class WriteSession(Base):
     __tablename__ = "write_sessions"
 
@@ -268,8 +308,18 @@ class WriteSession(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     file_id = Column(Integer, ForeignKey("files.id"), nullable=True)
 
+    # Versión que quedó asociada a la sesión al abrirla.
+    version_id = Column(
+        Integer,
+        ForeignKey("file_versions.id"),
+        nullable=True
+    )
+
     status = Column(String(30), default="IN_PROGRESS")
+    mode = Column(String(10), default="r")
 
     created_at = Column(DateTime, default=current_time)
     expires_at = Column(DateTime, nullable=False)
     completed_at = Column(DateTime, nullable=True)
+
+    version = relationship("FileVersion")

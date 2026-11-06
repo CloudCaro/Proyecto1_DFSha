@@ -1,6 +1,7 @@
 import hashlib
 import logging
 from urllib.parse import quote
+from datetime import datetime, timezone
 
 import httpx
 
@@ -12,20 +13,21 @@ from fastapi import (
 
 from fastapi.responses import Response
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from app.database import get_db
 
 from app.models import (
     User,
-    FileMetadata
+    FileMetadata,
+    FileVersion,
+    VersionBlock,
+    Block,
+    BlockReplica
 )
 
 from app.security import get_current_user
-
 from app.config import HEARTBEAT_TIMEOUT
-
-from datetime import datetime, timezone
 
 
 router = APIRouter(
@@ -36,25 +38,19 @@ router = APIRouter(
 logger = logging.getLogger("DFSha-Reads")
 
 
-# ==========================================
-# OBTENER UN BLOQUE DESDE SUS RÉPLICAS
-# ==========================================
-
 def retrieve_block(block):
+    """
+    Recupera un bloque desde alguna de sus réplicas disponibles.
+    Verifica su integridad mediante SHA-256.
+    """
 
     expected_hash = block.sha256
 
-    # Obtener las réplicas registradas del bloque.
-
-    replicas = block.replicas
-
-    # Priorizar réplicas activas y con heartbeat reciente.
-
-    current_time = datetime.now(timezone.utc).replace(tzinfo=None)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
 
     available_replicas = []
 
-    for replica in replicas:
+    for replica in block.replicas:
 
         node = replica.datanode
 
@@ -67,9 +63,7 @@ def retrieve_block(block):
         if node.last_heartbeat is None:
             continue
 
-        elapsed = (
-            current_time - node.last_heartbeat
-        ).total_seconds()
+        elapsed = (now - node.last_heartbeat).total_seconds()
 
         if elapsed > HEARTBEAT_TIMEOUT:
             continue
@@ -77,12 +71,9 @@ def retrieve_block(block):
         available_replicas.append(node)
 
     if not available_replicas:
-
         raise RuntimeError(
             f"No existen réplicas disponibles para el bloque {block.block_id}"
         )
-
-    # Intentar recuperar el bloque desde cada réplica.
 
     for node in available_replicas:
 
@@ -101,8 +92,6 @@ def retrieve_block(block):
             response.raise_for_status()
 
             block_content = response.content
-
-            # Verificar integridad del bloque.
 
             received_hash = hashlib.sha256(
                 block_content
@@ -123,21 +112,57 @@ def retrieve_block(block):
         except Exception as error:
 
             logger.warning(
-                "No se pudo recuperar el bloque %s desde %s: %s",
+                "No se pudo recuperar bloque %s desde %s: %s",
                 block.block_id,
                 node.node_id,
                 error
             )
 
     raise RuntimeError(
-        f"No fue posible recuperar ninguna réplica válida "
-        f"del bloque {block.block_id}"
+        f"No fue posible recuperar ninguna réplica válida del bloque {block.block_id}"
     )
 
 
-# ==========================================
-# DESCARGAR Y RECONSTRUIR ARCHIVO
-# ==========================================
+def reconstruct_version(version):
+    """
+    Reconstruye el archivo utilizando exclusivamente
+    los bloques asociados a una versión específica.
+    """
+
+    content = bytearray()
+
+    ordered_blocks = sorted(
+        version.blocks,
+        key=lambda item: item.block_index
+    )
+
+    for version_block in ordered_blocks:
+
+        block_content = retrieve_block(
+            version_block.block
+        )
+
+        content.extend(block_content)
+
+    result = bytes(content)
+
+    if len(result) != version.size:
+
+        raise RuntimeError(
+            f"El tamaño reconstruido ({len(result)}) "
+            f"no coincide con el esperado ({version.size})"
+        )
+
+    received_hash = hashlib.sha256(result).hexdigest()
+
+    if received_hash != version.sha256:
+
+        raise RuntimeError(
+            "El hash SHA-256 del archivo reconstruido no coincide"
+        )
+
+    return result
+
 
 @router.get("/download/{file_id}")
 def download_file(
@@ -145,8 +170,9 @@ def download_file(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-
-    # Buscar el archivo verificando que pertenezca al usuario.
+    """
+    Descarga la versión actualmente publicada del archivo.
+    """
 
     file_metadata = db.query(FileMetadata).filter(
         FileMetadata.id == file_id,
@@ -167,70 +193,47 @@ def download_file(
             detail="El archivo no está disponible para descarga"
         )
 
+    version = db.query(FileVersion).options(
+    joinedload(FileVersion.blocks)
+    .joinedload(VersionBlock.block)
+    .joinedload(Block.replicas)
+    .joinedload(BlockReplica.datanode)
+    ).filter(
+        FileVersion.file_id == file_metadata.id,
+        FileVersion.version_number == file_metadata.version,
+        FileVersion.status == "ACTIVE"
+    ).first()
+
+    if not version:
+
+        raise HTTPException(
+            status_code=500,
+            detail="No se encontraron los metadatos de la versión activa"
+        )
+
     try:
 
-        reconstructed_content = bytearray()
-
-        # Los bloques están ordenados por block_index
-        # mediante la relación definida en models.py.
-
-        for block in file_metadata.blocks:
-
-            block_content = retrieve_block(block)
-
-            reconstructed_content.extend(
-                block_content
-            )
-
-        # Convertir el contenido reconstruido a bytes.
-
-        reconstructed_content = bytes(
-            reconstructed_content
-        )
-
-        # Verificar el tamaño total.
-
-        if len(reconstructed_content) != file_metadata.size:
-
-            raise RuntimeError(
-                "El tamaño del archivo reconstruido no coincide"
-            )
-
-        # Verificar el hash del archivo completo.
-
-        reconstructed_hash = hashlib.sha256(
-            reconstructed_content
-        ).hexdigest()
-
-        if reconstructed_hash != file_metadata.sha256:
-
-            raise RuntimeError(
-                "El hash del archivo reconstruido no coincide"
-            )
-
-        logger.info(
-            "Archivo %s descargado correctamente por %s",
-            file_metadata.name,
-            current_user.username
-        )
+        content = reconstruct_version(version)
 
         return Response(
-            content=reconstructed_content,
+            content=content,
             media_type="application/octet-stream",
             headers={
                 "Content-Disposition": (
                     f"attachment; filename*=UTF-8''"
                     f"{quote(file_metadata.name)}"
                 ),
-                "X-File-SHA256": reconstructed_hash,
-                "X-File-Size": str(file_metadata.size)
+                "X-File-SHA256": version.sha256,
+                "X-File-Size": str(version.size),
+                "X-File-Version": str(version.version_number)
             }
         )
 
     except Exception as error:
 
         logger.exception(
-            "Error durante la reconstrucción del archivo"
+            "Error durante la descarga del archivo %s",
+            file_id
         )
 
         raise HTTPException(
