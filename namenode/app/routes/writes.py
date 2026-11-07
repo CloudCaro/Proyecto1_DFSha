@@ -23,7 +23,8 @@ from app.models import (
     VersionBlock,
     WriteSession,
     FileLock,
-    DataNode
+    DataNode,
+    current_time
 )
 
 from app.security import get_current_user
@@ -55,10 +56,16 @@ def split_content(content):
 
 def validate_filename(filename):
     if not filename:
-        raise HTTPException(400, "El archivo debe tener un nombre")
+        raise HTTPException(
+            status_code=400,
+            detail="El archivo debe tener un nombre"
+        )
 
     if filename in [".", ".."] or "/" in filename or "\\" in filename:
-        raise HTTPException(400, "Nombre de archivo inválido")
+        raise HTTPException(
+            status_code=400,
+            detail="Nombre de archivo inválido"
+        )
 
 
 def validate_session_and_lock(
@@ -74,22 +81,33 @@ def validate_session_and_lock(
     ).first()
 
     if not session:
-        raise HTTPException(404, "Sesión de escritura no encontrada")
+        raise HTTPException(
+            status_code=404,
+            detail="Sesión de escritura no encontrada"
+        )
 
     if session.status != "OPEN_WRITE":
-        raise HTTPException(409, "La sesión no está abierta en modo escritura")
+        raise HTTPException(
+            status_code=409,
+            detail="La sesión no está abierta en modo escritura"
+        )
 
     if session.file_id != file_id:
-        raise HTTPException(409, "La sesión no corresponde a este archivo")
-
-    from app.models import current_time
+        raise HTTPException(
+            status_code=409,
+            detail="La sesión no corresponde a este archivo"
+        )
 
     now = current_time()
 
     if session.expires_at <= now:
         session.status = "EXPIRED"
         db.commit()
-        raise HTTPException(401, "La sesión ha expirado")
+
+        raise HTTPException(
+            status_code=401,
+            detail="La sesión ha expirado"
+        )
 
     lock = db.query(FileLock).filter(
         FileLock.file_id == file_id,
@@ -98,12 +116,19 @@ def validate_session_and_lock(
     ).first()
 
     if not lock:
-        raise HTTPException(423, "No tienes el bloqueo del archivo")
+        raise HTTPException(
+            status_code=423,
+            detail="No tienes el bloqueo del archivo"
+        )
 
     if lock.expires_at <= now:
         db.delete(lock)
         db.commit()
-        raise HTTPException(423, "El bloqueo ha expirado")
+
+        raise HTTPException(
+            status_code=423,
+            detail="El bloqueo ha expirado"
+        )
 
     return session, lock
 
@@ -111,33 +136,47 @@ def validate_session_and_lock(
 def store_new_blocks(db, file_metadata, content):
     blocks_content = split_content(content)
 
-    block_sizes = [len(block) for block in blocks_content]
+    # Los archivos vacíos no necesitan bloques ni placement.
+    if not blocks_content:
+        return [], []
 
-    placement = create_block_placement(db, block_sizes)
+    block_sizes = [
+        len(block)
+        for block in blocks_content
+    ]
+
+    # El scheduler devuelve posiciones lógicas desde cero.
+    placement = create_block_placement(
+        db,
+        block_sizes
+    )
 
     created_blocks = []
     uploaded_blocks = []
 
     try:
         last_index = (
-        db.query(Block.block_index)
-        .filter(Block.file_id == file_metadata.id)
-        .order_by(Block.block_index.desc())
-        .first()
-    )
+            db.query(Block.block_index)
+            .filter(Block.file_id == file_metadata.id)
+            .order_by(Block.block_index.desc())
+            .first()
+        )
 
         physical_index = last_index[0] + 1 if last_index else 0
 
         for logical_index, block_content in enumerate(blocks_content):
-            index = physical_index + logical_index
+
+            physical_block_index = physical_index + logical_index
 
             block_id = uuid.uuid4().hex
 
-            block_hash = hashlib.sha256(block_content).hexdigest()
+            block_hash = hashlib.sha256(
+                block_content
+            ).hexdigest()
 
             block = Block(
                 block_id=block_id,
-                block_index=index,
+                block_index=physical_block_index,
                 size=len(block_content),
                 sha256=block_hash,
                 file_id=file_metadata.id
@@ -146,9 +185,12 @@ def store_new_blocks(db, file_metadata, content):
             db.add(block)
             db.flush()
 
+            # Importante:
+            # placement utiliza índices lógicos desde cero.
+            # Block.block_index utiliza índices físicos del archivo.
             selected_node_ids = [
                 replica["node_id"]
-                for replica in placement[index]["replicas"]
+                for replica in placement[logical_index]["replicas"]
             ]
 
             selected_nodes = db.query(DataNode).filter(
@@ -167,14 +209,20 @@ def store_new_blocks(db, file_metadata, content):
                 selected_nodes
             )
 
-            uploaded_blocks.append((block_id, uploaded_nodes))
+            uploaded_blocks.append(
+                (block_id, uploaded_nodes)
+            )
+
             created_blocks.append(block)
 
         return created_blocks, uploaded_blocks
 
     except Exception:
         for block_id, nodes in uploaded_blocks:
-            cleanup_block_replicas(block_id, nodes)
+            cleanup_block_replicas(
+                block_id,
+                nodes
+            )
 
         raise
 
@@ -203,12 +251,19 @@ def upload_file(
     if existing_file:
         raise HTTPException(
             status_code=409,
-            detail="Ya existe un archivo con ese nombre. Usa la operación de reemplazo."
+            detail=(
+                "Ya existe un archivo con ese nombre. "
+                "Usa la operación de reemplazo."
+            )
         )
 
     content = file.file.read()
+
     file_size = len(content)
-    file_hash = hashlib.sha256(content).hexdigest()
+
+    file_hash = hashlib.sha256(
+        content
+    ).hexdigest()
 
     uploaded_blocks = []
 
@@ -243,12 +298,14 @@ def upload_file(
         db.add(version)
         db.flush()
 
-        for block in blocks:
-            db.add(VersionBlock(
-                version_id=version.id,
-                block_id=block.id,
-                block_index=block.block_index
-            ))
+        for logical_index, block in enumerate(blocks):
+            db.add(
+                VersionBlock(
+                    version_id=version.id,
+                    block_id=block.id,
+                    block_index=logical_index
+                )
+            )
 
         new_file.status = "ACTIVE"
 
@@ -266,12 +323,18 @@ def upload_file(
         }
 
     except Exception as error:
+
         for block_id, nodes in uploaded_blocks:
-            cleanup_block_replicas(block_id, nodes)
+            cleanup_block_replicas(
+                block_id,
+                nodes
+            )
 
         db.rollback()
 
-        logger.exception("Error durante la escritura inicial")
+        logger.exception(
+            "Error durante la escritura inicial"
+        )
 
         raise HTTPException(
             status_code=500,
@@ -298,7 +361,10 @@ def replace_file(
     ).first()
 
     if not file_metadata:
-        raise HTTPException(404, "Archivo no encontrado o no disponible")
+        raise HTTPException(
+            status_code=404,
+            detail="Archivo no encontrado o no disponible"
+        )
 
     session, lock = validate_session_and_lock(
         db,
@@ -308,16 +374,31 @@ def replace_file(
         current_user.id
     )
 
+    # Evitar crear dos versiones pendientes para una misma sesión.
+    if session.version_id:
+        existing_session_version = db.query(FileVersion).filter(
+            FileVersion.id == session.version_id,
+            FileVersion.status == "PENDING"
+        ).first()
+
+        if existing_session_version:
+            raise HTTPException(
+                status_code=409,
+                detail="La sesión ya tiene un reemplazo pendiente"
+            )
+
     content = file.file.read()
+
     new_size = len(content)
-    new_hash = hashlib.sha256(content).hexdigest()
+
+    new_hash = hashlib.sha256(
+        content
+    ).hexdigest()
 
     uploaded_blocks = []
-    created_blocks = []
 
     try:
-        # La versión anterior permanece intacta.
-        # Los bloques nuevos se crean con nuevos identificadores.
+        # Almacenar los bloques nuevos sin modificar la versión publicada.
         created_blocks, uploaded_blocks = store_new_blocks(
             db,
             file_metadata,
@@ -326,69 +407,69 @@ def replace_file(
 
         new_version_number = file_metadata.version + 1
 
+        # Crear una versión pendiente.
+        # Todavía no se modifica FileMetadata.
         new_version = FileVersion(
             file_id=file_metadata.id,
             version_number=new_version_number,
             size=new_size,
             sha256=new_hash,
-            status="ACTIVE"
+            status="PENDING"
         )
 
         db.add(new_version)
         db.flush()
 
         for logical_index, block in enumerate(created_blocks):
-            db.add(VersionBlock(
-                version_id=new_version.id,
-                block_id=block.id,
-                block_index=logical_index
-            ))
+            db.add(
+                VersionBlock(
+                    version_id=new_version.id,
+                    block_id=block.id,
+                    block_index=logical_index
+                )
+            )
 
-        # Publicación de la versión: se actualizan los metadatos
-        # únicamente después de almacenar todas las réplicas.
-        old_version = db.query(FileVersion).filter(
-            FileVersion.file_id == file_metadata.id,
-            FileVersion.version_number == file_metadata.version
-        ).first()
-
-        if old_version:
-            old_version.status = "RETAINED"
-
-        file_metadata.size = new_size
-        file_metadata.sha256 = new_hash
-        file_metadata.version = new_version_number
-
+        # La sesión queda asociada a la versión pendiente.
+        # CLOSE será responsable de publicarla.
         session.version_id = new_version.id
-        session.status = "COMPLETED"
-        session.completed_at = __import__(
-            "app.models", fromlist=["current_time"]
-        ).current_time()
 
-        db.delete(lock)
         db.commit()
 
         return {
-            "message": "Archivo reemplazado correctamente",
+            "message": (
+                "Contenido almacenado. "
+                "La nueva versión está pendiente de confirmación."
+            ),
             "file_id": file_metadata.id,
             "filename": file_metadata.name,
             "version": new_version_number,
             "size": new_size,
             "sha256": new_hash,
             "blocks": len(created_blocks),
-            "status": "ACTIVE"
+            "status": "PENDING",
+            "requires_close": True
         }
 
+    except HTTPException:
+        raise
+
     except Exception as error:
+
         for block_id, nodes in uploaded_blocks:
-            cleanup_block_replicas(block_id, nodes)
+            cleanup_block_replicas(
+                block_id,
+                nodes
+            )
 
         db.rollback()
 
-        logger.exception("Error durante el reemplazo del archivo")
+        logger.exception(
+            "Error durante el reemplazo del archivo"
+        )
 
         raise HTTPException(
             status_code=500,
-            detail=f"No se pudo reemplazar el archivo: {error}"
+            detail=f"No se pudo preparar el reemplazo: {error}"
         )
 
     finally:

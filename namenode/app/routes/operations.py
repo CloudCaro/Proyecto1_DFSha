@@ -4,6 +4,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
@@ -16,10 +17,9 @@ from app.models import (
     VersionBlock,
     WriteSession,
     FileLock,
-    FileVersion,
-    VersionBlock,
     Block,
-    BlockReplica
+    BlockReplica,
+    current_time
 )
 
 from app.security import get_current_user
@@ -37,10 +37,6 @@ SESSION_DURATION = 60
 LOCK_DURATION = 30
 
 
-def current_time():
-    return datetime.now(timezone.utc).replace(tzinfo=None)
-
-
 def get_session_or_404(db, session_id, user_id):
 
     session = db.query(WriteSession).filter(
@@ -49,15 +45,28 @@ def get_session_or_404(db, session_id, user_id):
     ).first()
 
     if not session:
-        raise HTTPException(404, "Sesión no encontrada")
+        raise HTTPException(
+            status_code=404,
+            detail="Sesión no encontrada"
+        )
 
-    if session.status not in ("OPEN_READ", "OPEN_WRITE"):
-        raise HTTPException(409, "La sesión no está abierta")
+    if session.status not in (
+        "OPEN_READ",
+        "OPEN_WRITE"
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="La sesión no está abierta"
+        )
 
     if session.expires_at <= current_time():
         session.status = "EXPIRED"
         db.commit()
-        raise HTTPException(401, "La sesión ha expirado")
+
+        raise HTTPException(
+            status_code=401,
+            detail="La sesión ha expirado"
+        )
 
     return session
 
@@ -77,7 +86,10 @@ def open_file(
     ).first()
 
     if not file_metadata:
-        raise HTTPException(404, "Archivo no encontrado")
+        raise HTTPException(
+            status_code=404,
+            detail="Archivo no encontrado"
+        )
 
     version = db.query(FileVersion).filter(
         FileVersion.file_id == file_id,
@@ -86,7 +98,10 @@ def open_file(
     ).first()
 
     if not version:
-        raise HTTPException(500, "No existe la versión activa del archivo")
+        raise HTTPException(
+            status_code=500,
+            detail="No existe la versión activa del archivo"
+        )
 
     if mode == "w":
 
@@ -95,7 +110,10 @@ def open_file(
         ).first()
 
         if lock and lock.expires_at > current_time():
-            raise HTTPException(423, "El archivo ya está bloqueado")
+            raise HTTPException(
+                status_code=423,
+                detail="El archivo ya está bloqueado"
+            )
 
         if lock:
             db.delete(lock)
@@ -110,7 +128,9 @@ def open_file(
         version_id=version.id,
         mode=mode,
         status="OPEN_READ" if mode == "r" else "OPEN_WRITE",
-        expires_at=current_time() + timedelta(minutes=SESSION_DURATION)
+        expires_at=current_time() + timedelta(
+            minutes=SESSION_DURATION
+        )
     )
 
     db.add(session)
@@ -132,7 +152,11 @@ def open_file(
 def read_file(
     session_id: str,
     offset: int = Query(default=0, ge=0),
-    length: int = Query(default=4096, gt=0, le=4 * 1024 * 1024),
+    length: int = Query(
+        default=4096,
+        gt=0,
+        le=4 * 1024 * 1024
+    ),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -144,7 +168,10 @@ def read_file(
     )
 
     if session.status != "OPEN_READ":
-        raise HTTPException(409, "La sesión no está abierta en modo lectura")
+        raise HTTPException(
+            status_code=409,
+            detail="La sesión no está abierta en modo lectura"
+        )
 
     version = db.query(FileVersion).options(
         joinedload(FileVersion.blocks)
@@ -157,7 +184,10 @@ def read_file(
     ).first()
 
     if not version:
-        raise HTTPException(404, "La versión de lectura no está disponible")
+        raise HTTPException(
+            status_code=404,
+            detail="La versión de lectura no está disponible"
+        )
 
     if offset >= version.size:
         return {
@@ -169,7 +199,10 @@ def read_file(
         }
 
     start = offset
-    end = min(offset + length, version.size)
+    end = min(
+        offset + length,
+        version.size
+    )
 
     result = bytearray()
     cursor = 0
@@ -193,10 +226,24 @@ def read_file(
 
             block_content = retrieve_block(block)
 
-            local_start = max(start - block_start, 0)
-            local_end = min(end - block_start, len(block_content))
+            local_start = max(
+                start - block_start,
+                0
+            )
 
-            result.extend(block_content[local_start:local_end])
+            local_end = min(
+                end - block_start,
+                len(block_content)
+            )
+
+            result.extend(
+                block_content[local_start:local_end]
+            )
+
+        if len(result) != end - start:
+            raise RuntimeError(
+                "La cantidad de bytes leídos no coincide con el rango solicitado"
+            )
 
         return {
             "file_id": session.file_id,
@@ -208,10 +255,13 @@ def read_file(
 
     except Exception as error:
 
-        logger.exception("Error leyendo versión %s", version.id)
+        logger.exception(
+            "Error leyendo versión %s",
+            version.id
+        )
 
         raise HTTPException(
-            500,
+            status_code=500,
             detail=f"No se pudo leer el archivo: {error}"
         )
 
@@ -236,7 +286,100 @@ def close_file(
             FileLock.user_id == current_user.id
         ).first()
 
-        if lock:
+        # Si hay una versión pendiente, CLOSE debe publicarla.
+        pending_version = None
+
+        if session.version_id:
+            pending_version = db.query(FileVersion).filter(
+                FileVersion.id == session.version_id,
+                FileVersion.file_id == session.file_id,
+                FileVersion.status == "PENDING"
+            ).first()
+
+        if pending_version:
+
+            if not lock:
+                raise HTTPException(
+                    status_code=423,
+                    detail="No existe un bloqueo para confirmar la escritura"
+                )
+
+            if lock.expires_at <= current_time():
+                db.delete(lock)
+                db.commit()
+
+                raise HTTPException(
+                    status_code=423,
+                    detail="El bloqueo expiró antes de confirmar la escritura"
+                )
+
+            file_metadata = db.query(FileMetadata).filter(
+                FileMetadata.id == session.file_id,
+                FileMetadata.owner_id == current_user.id,
+                FileMetadata.status == "ACTIVE"
+            ).with_for_update().first()
+
+            if not file_metadata:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Archivo no disponible para publicar la versión"
+                )
+
+            # Control de concurrencia:
+            # la versión anterior debe seguir siendo la publicada.
+            expected_version = pending_version.version_number - 1
+
+            if file_metadata.version != expected_version:
+                raise HTTPException(
+                    status_code=409,
+                    detail="El archivo cambió desde que se inició el reemplazo"
+                )
+
+            # Verificar que todos los bloques tengan las réplicas requeridas.
+            version_blocks = db.query(VersionBlock).filter(
+                VersionBlock.version_id == pending_version.id
+            ).all()
+
+            for version_block in version_blocks:
+
+                active_replicas = db.query(BlockReplica).filter(
+                    BlockReplica.block_id == version_block.block_id,
+                    BlockReplica.status == "ACTIVE"
+                ).count()
+
+                if active_replicas < 2:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=(
+                            "No se puede publicar la versión: "
+                            "un bloque no tiene las dos réplicas requeridas"
+                        )
+                    )
+
+            old_version = db.query(FileVersion).filter(
+                FileVersion.file_id == file_metadata.id,
+                FileVersion.version_number == file_metadata.version,
+                FileVersion.status == "ACTIVE"
+            ).first()
+
+            if not old_version:
+                raise HTTPException(
+                    status_code=500,
+                    detail="No se encontró la versión anterior activa"
+                )
+
+            old_version.status = "RETAINED"
+
+            pending_version.status = "ACTIVE"
+
+            file_metadata.size = pending_version.size
+            file_metadata.sha256 = pending_version.sha256
+            file_metadata.version = pending_version.version_number
+
+            db.delete(lock)
+
+        elif lock:
+            # Si no hubo reemplazo, CLOSE solo libera el bloqueo.
             db.delete(lock)
 
     session.status = "CLOSED"
@@ -246,7 +389,10 @@ def close_file(
 
     return {
         "message": "Sesión cerrada correctamente",
-        "session_id": session_id
+        "session_id": session_id,
+        "write_committed": bool(
+            session.mode == "w" and pending_version
+        ) if session.mode == "w" else False
     }
 
 
@@ -266,8 +412,8 @@ def lock_file(
 
     if session.file_id != file_id or session.status != "OPEN_WRITE":
         raise HTTPException(
-            409,
-            "Se necesita una sesión abierta en modo escritura"
+            status_code=409,
+            detail="Se necesita una sesión abierta en modo escritura"
         )
 
     now = current_time()
@@ -277,7 +423,10 @@ def lock_file(
     ).first()
 
     if existing and existing.expires_at > now:
-        raise HTTPException(423, "El archivo ya tiene un bloqueo activo")
+        raise HTTPException(
+            status_code=423,
+            detail="El archivo ya tiene un bloqueo activo"
+        )
 
     if existing:
         db.delete(existing)
@@ -290,7 +439,9 @@ def lock_file(
         user_id=current_user.id,
         lock_token=token,
         acquired_at=now,
-        expires_at=now + timedelta(seconds=LOCK_DURATION)
+        expires_at=now + timedelta(
+            seconds=LOCK_DURATION
+        )
     )
 
     db.add(lock)
@@ -300,7 +451,11 @@ def lock_file(
 
     except IntegrityError:
         db.rollback()
-        raise HTTPException(423, "Otro usuario adquirió el bloqueo")
+
+        raise HTTPException(
+            status_code=423,
+            detail="Otro usuario adquirió el bloqueo"
+        )
 
     return {
         "message": "Bloqueo adquirido correctamente",
@@ -325,12 +480,19 @@ def unlock_file(
     ).first()
 
     if not lock:
-        raise HTTPException(404, "Bloqueo no encontrado")
+        raise HTTPException(
+            status_code=404,
+            detail="Bloqueo no encontrado"
+        )
 
     if lock.expires_at <= current_time():
         db.delete(lock)
         db.commit()
-        raise HTTPException(410, "El bloqueo ha expirado")
+
+        raise HTTPException(
+            status_code=410,
+            detail="El bloqueo ha expirado"
+        )
 
     db.delete(lock)
     db.commit()
