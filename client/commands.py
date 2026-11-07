@@ -168,6 +168,24 @@ class CommandManager:
         self.lock_token = result["lock_token"]
 
         return result
+    
+    def unlock(self):
+
+        self.require_login()
+
+        if not self.current_session or not self.lock_token:
+            raise RuntimeError(
+                "No hay un bloqueo activo para liberar"
+            )
+
+        result = self.files.unlock(
+            self.current_file_id,
+            self.lock_token
+        )
+
+        self.lock_token = None
+
+        return result
 
     def write(self, path):
 

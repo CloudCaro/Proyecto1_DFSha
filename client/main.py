@@ -69,6 +69,7 @@ rm <file_id>
 
 open <file_id> <r|w>
 lock
+unlock
 write <ruta_local>
 read [offset] [length]
 close
@@ -165,6 +166,12 @@ exit
             elif action == "lock":
 
                 result = client.lock()
+
+                print_result(result)
+
+            elif action == "unlock":
+
+                result = client.unlock()
 
                 print_result(result)
 
