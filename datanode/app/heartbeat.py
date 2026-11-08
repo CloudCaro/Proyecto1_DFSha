@@ -48,14 +48,7 @@ async def register_node(client):
 
 
 def get_node_port():
-
-    ports = {
-        "DN1": 8001,
-        "DN2": 8002,
-        "DN3": 8003
-    }
-
-    return ports.get(DN_ID, 8001)
+    return 8001
 
 
 async def heartbeat_loop():

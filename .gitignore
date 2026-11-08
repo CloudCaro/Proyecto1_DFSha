@@ -9,3 +9,6 @@ aes_migration_backup/
 *.db-journal
 *.db-wal
 *.db-shm
+diagnostico_get.txt
+archivo_4/
+prueba_aes.txt
