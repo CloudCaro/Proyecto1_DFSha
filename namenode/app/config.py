@@ -1,6 +1,12 @@
 import os
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+# Cargar secretos desde el .env ubicado en la raíz del repositorio.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+load_dotenv(PROJECT_ROOT / ".env", override=True)
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 DATABASE_PATH = Path(

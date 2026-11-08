@@ -5,3 +5,7 @@ __pycache__/
 *.db
 storage/
 .pytest_cache/
+aes_migration_backup/
+*.db-journal
+*.db-wal
+*.db-shm

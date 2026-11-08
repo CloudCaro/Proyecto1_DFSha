@@ -2,6 +2,12 @@ import os
 from pathlib import Path
 import base64
 
+from dotenv import load_dotenv
+
+# Cargar secretos desde el .env ubicado en la raíz del repositorio.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+load_dotenv(PROJECT_ROOT / ".env", override=True)
+
 DN_ID = os.getenv("DN_ID", "DN1")
 
 STORAGE_PATH = Path(os.getenv("STORAGE_PATH", "./storage"))

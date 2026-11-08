@@ -1,0 +1,87 @@
+services:
+  namenode:
+    build:
+      context: .
+      dockerfile: namenode/Dockerfile
+    container_name: dfsha-namenode
+    env_file:
+      - .env
+    environment:
+      DATABASE_PATH: /data/dfsha.db
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./namenode/dfsha.db:/data/dfsha.db
+    restart: unless-stopped
+    networks:
+      - dfsha-net
+
+  datanode1:
+    build:
+      context: .
+      dockerfile: datanode/Dockerfile
+    container_name: dfsha-dn1
+    env_file:
+      - .env
+    environment:
+      DN_ID: DN1
+      STORAGE_PATH: /data
+      NAMENODE_URL: http://namenode:8000
+      NODE_HOST: datanode1
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./storage/DN1:/data
+    depends_on:
+      - namenode
+    restart: unless-stopped
+    networks:
+      - dfsha-net
+
+  datanode2:
+    build:
+      context: .
+      dockerfile: datanode/Dockerfile
+    container_name: dfsha-dn2
+    env_file:
+      - .env
+    environment:
+      DN_ID: DN2
+      STORAGE_PATH: /data
+      NAMENODE_URL: http://namenode:8000
+      NODE_HOST: datanode2
+    ports:
+      - "8002:8001"
+    volumes:
+      - ./storage/DN2:/data
+    depends_on:
+      - namenode
+    restart: unless-stopped
+    networks:
+      - dfsha-net
+
+  datanode3:
+    build:
+      context: .
+      dockerfile: datanode/Dockerfile
+    container_name: dfsha-dn3
+    env_file:
+      - .env
+    environment:
+      DN_ID: DN3
+      STORAGE_PATH: /data
+      NAMENODE_URL: http://namenode:8000
+      NODE_HOST: datanode3
+    ports:
+      - "8003:8001"
+    volumes:
+      - ./storage/DN3:/data
+    depends_on:
+      - namenode
+    restart: unless-stopped
+    networks:
+      - dfsha-net
+
+networks:
+  dfsha-net:
+    driver: bridge

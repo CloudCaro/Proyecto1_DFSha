@@ -81,49 +81,79 @@ def _node_is_alive(node, now):
 
 def recover_under_replicated_blocks(db: Session):
     """
-    Repara bloques que tengan menos réplicas ACTIVE que REPLICATION_FACTOR.
-    Lee una copia sana, valida SHA-256 y crea la copia faltante en otro nodo.
+    Reconcilia las réplicas registradas con los bloques físicamente disponibles.
+    Reactiva una réplica INACTIVE solo si el Datanode está vivo, el bloque existe
+    y su SHA-256 coincide con los metadatos. Después crea las copias faltantes.
     """
     now = current_time()
     nodes = db.query(DataNode).all()
 
     for node in nodes:
         alive = _node_is_alive(node, now)
-        if node.status != ("ACTIVE" if alive else "INACTIVE"):
-            node.status = "ACTIVE" if alive else "INACTIVE"
+        node.status = "ACTIVE" if alive else "INACTIVE"
 
     db.flush()
     healthy_nodes = [n for n in nodes if _node_is_alive(n, now)]
     if not healthy_nodes:
         db.commit()
-        return {"blocks_checked": 0, "replicas_created": 0}
+        return {"blocks_checked": 0, "replicas_created": 0, "replicas_reactivated": 0}
 
     blocks = db.query(Block).all()
     replicas_created = 0
+    replicas_reactivated = 0
     blocks_checked = 0
 
     for block in blocks:
         blocks_checked += 1
-        replicas = db.query(BlockReplica).filter(
-            BlockReplica.block_id == block.id,
-            BlockReplica.status == "ACTIVE"
+
+        # IMPORTANTE: consultar TODAS las réplicas, incluidas las INACTIVE.
+        all_replicas = db.query(BlockReplica).filter(
+            BlockReplica.block_id == block.id
         ).all()
 
-        healthy_replicas = [
-            r for r in replicas
-            if r.datanode and _node_is_alive(r.datanode, now)
-        ]
+        healthy_replicas = []
+        existing_node_ids = set()
 
-        # Marcar como INACTIVE las réplicas alojadas en nodos caídos.
-        for replica in replicas:
-            if not replica.datanode or not _node_is_alive(replica.datanode, now):
+        # La conectividad del nodo no basta: comprobamos existencia e integridad física.
+        for replica in all_replicas:
+            node = replica.datanode
+            if node is None or not _node_is_alive(node, now):
                 replica.status = "INACTIVE"
+                continue
 
-        existing_node_ids = {r.datanode_id for r in healthy_replicas}
+            try:
+                response = httpx.get(
+                    f"http://{node.host}:{node.port}/blocks/{block.block_id}",
+                    timeout=30.0
+                )
+                response.raise_for_status()
+                content = response.content
+
+                if len(content) != block.size:
+                    raise ValueError("Tamaño físico diferente al registrado")
+                if hashlib.sha256(content).hexdigest() != block.sha256:
+                    raise ValueError("SHA-256 físico diferente al registrado")
+
+                if replica.status != "ACTIVE":
+                    replica.status = "ACTIVE"
+                    replicas_reactivated += 1
+                    logger.info("Réplica reactivada: bloque %s en %s",
+                                block.block_id, node.node_id)
+
+                healthy_replicas.append(replica)
+                existing_node_ids.add(node.id)
+
+            except (httpx.HTTPError, ValueError) as error:
+                replica.status = "INACTIVE"
+                logger.warning("Réplica no válida: bloque %s en %s: %s",
+                               block.block_id, node.node_id, error)
+
+        db.flush()
+
         if len(existing_node_ids) >= REPLICATION_FACTOR:
             continue
 
-        # Buscar una fuente sana y descargar el bloque.
+        # Elegir una copia comprobada como fuente.
         content = None
         for replica in healthy_replicas:
             source = replica.datanode
@@ -134,18 +164,16 @@ def recover_under_replicated_blocks(db: Session):
                 )
                 response.raise_for_status()
                 candidate = response.content
-                if hashlib.sha256(candidate).hexdigest() != block.sha256:
-                    logger.error("Hash inválido al recuperar %s desde %s",
-                                 block.block_id, source.node_id)
-                    continue
-                content = candidate
-                break
+                if (len(candidate) == block.size and
+                        hashlib.sha256(candidate).hexdigest() == block.sha256):
+                    content = candidate
+                    break
             except httpx.HTTPError as error:
                 logger.warning("No se pudo leer %s desde %s: %s",
                                block.block_id, source.node_id, error)
 
         if content is None:
-            logger.error("Bloque %s no recuperable: no hay copia sana",
+            logger.error("Bloque %s no recuperable: no hay copia física sana",
                          block.block_id)
             continue
 
@@ -189,12 +217,12 @@ def recover_under_replicated_blocks(db: Session):
                         datanode_id=destination.id,
                         status="ACTIVE"
                     ))
+                    destination.used_space += block.size
 
-                destination.used_space += block.size
                 existing_node_ids.add(destination.id)
                 replicas_created += 1
                 db.commit()
-                logger.info("Réplica recuperada: bloque %s en %s",
+                logger.info("Réplica creada: bloque %s en %s",
                             block.block_id, destination.node_id)
             except Exception:
                 db.rollback()
@@ -204,5 +232,6 @@ def recover_under_replicated_blocks(db: Session):
     db.commit()
     return {
         "blocks_checked": blocks_checked,
-        "replicas_created": replicas_created
+        "replicas_created": replicas_created,
+        "replicas_reactivated": replicas_reactivated
     }
