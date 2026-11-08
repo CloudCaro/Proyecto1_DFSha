@@ -55,6 +55,34 @@ def get_root_directory(
 
 
 # ==========================================
+# BUSCAR DIRECTORIO HIJO
+# ==========================================
+
+def get_child_directory(
+    db: Session,
+    user_id: int,
+    parent_id: int,
+    name: str
+):
+
+    parent = get_directory(db, user_id, parent_id)
+
+    directory = db.query(Directory).filter(
+        Directory.owner_id == user_id,
+        Directory.parent_id == parent.id,
+        Directory.name == name
+    ).first()
+
+    if not directory:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No existe el directorio '{name}'"
+        )
+
+    return directory
+
+
+# ==========================================
 # CREAR DIRECTORIO
 # ==========================================
 

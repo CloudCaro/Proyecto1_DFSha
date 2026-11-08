@@ -87,6 +87,39 @@ class CommandManager:
 
         return response.json()
 
+    def cd(self, path):
+
+        self.require_login()
+
+        path = path.strip()
+
+        if not path:
+            raise ValueError("Debes indicar el directorio de destino")
+
+        if path == "/":
+            root = self.namenode.get("/filesystem/root").json()
+            self.current_directory = root["id"]
+            return {"directory": "/", "id": self.current_directory}
+
+        if path == "..":
+            response = self.namenode.get(
+                f"/filesystem/parent/{self.current_directory}"
+            )
+            directory = response.json()
+            self.current_directory = directory["id"]
+            return directory
+
+        if path in [".", ""]:
+            return {"id": self.current_directory, "message": "Ya estás en este directorio"}
+
+        response = self.namenode.get(
+            f"/filesystem/resolve/{self.current_directory}",
+            params={"name": path}
+        )
+        directory = response.json()
+        self.current_directory = directory["id"]
+        return directory
+
     def mkdir(self, name):
 
         self.require_login()

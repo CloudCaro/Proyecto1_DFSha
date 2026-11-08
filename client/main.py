@@ -60,6 +60,7 @@ login <usuario> <contraseña>
 logout
 
 ls
+cd <nombre|..|/>
 mkdir <nombre>
 rmdir <directory_id>
 
@@ -107,6 +108,11 @@ exit
 
                 result = client.ls()
 
+                print_result(result)
+
+            elif action == "cd":
+
+                result = client.cd(args[1])
                 print_result(result)
 
             elif action == "mkdir":
